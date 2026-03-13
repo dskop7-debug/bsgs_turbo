@@ -1,0 +1,33 @@
+# Compiled object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.dll
+*.so
+*.dylib
+build/
+
+# IDE/OS files
+.vscode/
+.vs/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Test output and temporary files
+*.txt
+!CMakeLists.txt
+compile_errors.txt
+err*.txt
+build_log.txt
+test_hello.cpp
+build.sh
+KEYFOUND.txt
+
+# Do not ignore pubkeys if we want an example, but ignore by default large lists
+# We will explicitly add any test_pubkey.txt we want later
