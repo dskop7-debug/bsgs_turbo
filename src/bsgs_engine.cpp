@@ -70,10 +70,6 @@ bool BSGSEngine::init(const BSGSConfig& config, const std::vector<PointAffine>& 
     const int BATCH_SIZE = 4096;
     PointJacobian* jac_batch = new PointJacobian[BATCH_SIZE];
     PointAffine* aff_batch = new PointAffine[BATCH_SIZE];
-
-    PointJacobian current = PointJacobian::from_affine(G_);
-    PointAffine current_affine = G_;
-
     // Store 0*G? Skip index 0 to avoid degenerate case
     // Baby step i: store point = i*G, key = i
     // We precompute in batches for batch affine conversion
@@ -203,7 +199,6 @@ void BSGSEngine::add_result(const uint256_t& privkey, const PointAffine& pubkey,
 }
 
 void BSGSEngine::worker_sequential(int thread_id, uint256_t start, uint256_t end) {
-    const uint256_t& n = get_n();
     uint64_t m = baby_count_;
 
     // For each target pubkey
@@ -271,8 +266,9 @@ void BSGSEngine::worker_sequential(int thread_id, uint256_t start, uint256_t end
             
             // 3. Process the batch (hash table lookups)
             for (int b = 0; b < current_batch; b++) {
-                uint64_t x_prefix = aff_batch[b].x.v[0];
-                int64_t baby_idx = hash_table_->lookup(x_prefix);
+                if (aff_batch[b].infinity) continue;
+
+                int64_t baby_idx = baby_table_.lookup(aff_batch[b].x);
                 if (baby_idx >= 0) {
                     // Potential match! Extract actual index and endo flag
                     uint64_t raw_idx = (uint64_t)baby_idx;
@@ -317,7 +313,6 @@ void BSGSEngine::worker_sequential(int thread_id, uint256_t start, uint256_t end
 }
 
 void BSGSEngine::worker_random(int thread_id) {
-    const uint256_t& n = get_n();
     uint64_t m = baby_count_;
 
     // Random number generator for this thread
@@ -329,6 +324,12 @@ void BSGSEngine::worker_random(int thread_id) {
     // Negate giant step for subtraction
     PointAffine neg_giant = giant_step_;
     neg_giant.y = mod_neg(neg_giant.y);
+    
+    // Allocate once per thread outside the infinite loop
+    const int BATCH_SIZE = 4096;
+    PointJacobian* jac_batch = new PointJacobian[BATCH_SIZE];
+    PointAffine* aff_batch = new PointAffine[BATCH_SIZE];
+    uint256_t* key_batch = new uint256_t[BATCH_SIZE];
 
     while (!all_found_.load()) {
         // Pick random starting point in range
@@ -373,16 +374,10 @@ void BSGSEngine::worker_random(int thread_id) {
             PointJacobian point_jac = point_add_mixed(
                 PointJacobian::from_affine(targets_[t]), neg_sG);
 
-            // We do a small batch of 4096 here as well
-            const int BATCH_SIZE = 4096;
-            PointJacobian* jac_batch = new PointJacobian[BATCH_SIZE];
-            PointAffine* aff_batch = new PointAffine[BATCH_SIZE];
-            uint256_t* key_batch = new uint256_t[BATCH_SIZE];
-            
             uint256_t current_key_batch = current_key;
             int current_batch = 0;
 
-            while (current_batch < BATCH_SIZE && current_key <= end && !all_found_.load() && !target_found_[t].load()) {
+            while (current_batch < BATCH_SIZE && !all_found_.load() && !target_found_[t].load()) {
                 jac_batch[current_batch] = point_jac;
                 key_batch[current_batch] = current_key;
                 
@@ -393,42 +388,41 @@ void BSGSEngine::worker_random(int thread_id) {
             }
             
             // To be much faster, we compute affine variants in batch to save modular inversions
-            PointJacobian::to_affine_batch(jac_batch, current_batch, aff_batch);
+            to_affine_batch(jac_batch, aff_batch, current_batch);
 
-                for (int b = 0; b < current_batch; b++) {
-                    if (aff_batch[b].infinity) continue;
+            for (int b = 0; b < current_batch; b++) {
+                if (aff_batch[b].infinity) continue;
 
-                    int64_t baby_idx = baby_table_.lookup(aff_batch[b].x);
-                    if (baby_idx >= 0) {
-                        uint64_t raw_idx = (uint64_t)baby_idx;
-                        uint64_t endo_flag = (raw_idx >> 46) & 3;
-                        uint64_t actual_baby = raw_idx & ((1ULL << 46) - 1);
+                int64_t baby_idx = baby_table_.lookup(aff_batch[b].x);
+                if (baby_idx >= 0) {
+                    uint64_t raw_idx = (uint64_t)baby_idx;
+                    uint64_t endo_flag = (raw_idx >> 46) & 3;
+                    uint64_t actual_baby = raw_idx & ((1ULL << 46) - 1);
 
-                        uint256_t baby_key = uint256_t(actual_baby);
-                        if (endo_flag == 1) {
-                            baby_key = mod_n_mul(baby_key, get_lambda2());
-                        } else if (endo_flag == 2) {
-                            baby_key = mod_n_mul(baby_key, get_lambda());
-                        }
+                    uint256_t baby_key = uint256_t(actual_baby);
+                    if (endo_flag == 1) {
+                        baby_key = mod_n_mul(baby_key, get_lambda2());
+                    } else if (endo_flag == 2) {
+                        baby_key = mod_n_mul(baby_key, get_lambda());
+                    }
 
-                        uint256_t found_key = uint256_add(key_batch[b], baby_key);
+                    uint256_t found_key = uint256_add(key_batch[b], baby_key);
 
-                        PointJacobian verify_jac = scalar_mult(G_, found_key);
-                        PointAffine verify = to_affine(verify_jac);
+                    PointJacobian verify_jac = scalar_mult(G_, found_key);
+                    PointAffine verify = to_affine(verify_jac);
 
-                        if (verify.x == targets_[t].x && verify.y == targets_[t].y) {
-                            add_result(found_key, targets_[t], (int)t);
-                        }
+                    if (verify.x == targets_[t].x && verify.y == targets_[t].y) {
+                        add_result(found_key, targets_[t], (int)t);
                     }
                 }
-                total_keys_.fetch_add((uint64_t)m * current_batch, std::memory_order_relaxed);
             }
-
-            delete[] jac_batch;
-            delete[] aff_batch;
-            delete[] key_batch;
+            total_keys_.fetch_add((uint64_t)m * current_batch, std::memory_order_relaxed);
         }
     }
+
+    delete[] jac_batch;
+    delete[] aff_batch;
+    delete[] key_batch;
 }
 
 // Helper for mod n operations  
