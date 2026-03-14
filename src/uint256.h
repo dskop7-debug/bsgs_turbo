@@ -368,29 +368,30 @@ inline uint256_t mod_inv(const uint256_t& a) {
     return result;
 }
 
-// ==================== Batch Modular Inversion (Montgomery's Trick) ====================
-// Given n values a[0..n-1], compute their inverses using only 1 inversion + 3(n-1) multiplications
 inline void mod_inv_batch(const uint256_t* a, uint256_t* inv_out, int n) {
     if (n == 0) return;
-    if (n == 1) { inv_out[0] = mod_inv(a[0]); return; }
 
-    // Step 1: Compute prefix products
-    // prefix[i] = a[0] * a[1] * ... * a[i]
     uint256_t* prefix = new uint256_t[n];
-    prefix[0] = a[0];
-    for (int i = 1; i < n; i++) {
-        prefix[i] = mod_mul(prefix[i-1], a[i]);
+    uint256_t acc(1ULL);
+    
+    for (int i = 0; i < n; i++) {
+        if (!a[i].is_zero()) {
+            acc = mod_mul(acc, a[i]);
+        }
+        prefix[i] = acc;
     }
 
-    // Step 2: Invert the product of all elements
-    uint256_t inv = mod_inv(prefix[n-1]);
+    uint256_t inv = mod_inv(acc);
 
-    // Step 3: Compute individual inverses
-    for (int i = n - 1; i > 0; i--) {
-        inv_out[i] = mod_mul(inv, prefix[i-1]);
-        inv = mod_mul(inv, a[i]);
+    for (int i = n - 1; i >= 0; i--) {
+        if (a[i].is_zero()) {
+            inv_out[i] = uint256_t();
+        } else {
+            uint256_t prev = (i > 0) ? prefix[i-1] : uint256_t(1ULL);
+            inv_out[i] = mod_mul(inv, prev);
+            inv = mod_mul(inv, a[i]);
+        }
     }
-    inv_out[0] = inv;
 
     delete[] prefix;
 }

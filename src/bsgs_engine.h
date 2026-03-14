@@ -62,6 +62,10 @@ private:
     PointAffine giant_step_;  // m * G (the giant step increment)
     uint64_t baby_count_;     // Number of baby steps stored
 
+    PointAffine* giant_batch_ = nullptr;
+    uint256_t* giant_step_keys_ = nullptr;
+    PointAffine neg_batch_giant_;
+
     // Also store endomorphism variants of targets
     std::vector<PointAffine> targets_endo1_;  // beta*x targets
     std::vector<PointAffine> targets_endo2_;  // beta^2*x targets
@@ -80,6 +84,9 @@ private:
 
     // Add a result
     void add_result(const uint256_t& privkey, const PointAffine& pubkey, int target_idx);
+
+    // Reconstruct and verify match
+    void check_match_affine(const uint256_t& key_checked, const uint256_t& X_match, int target_idx);
 
     // Check giant step point against hash table for all targets
     bool check_point(const PointAffine& point, const uint256_t& giant_key, int target_idx);
