@@ -222,25 +222,19 @@ int main(int argc, char* argv[]) {
     config.range_start = range_from;
     config.range_end = range_to;
 
-    // Calculate baby steps
-    if (n_specified) {
-        config.baby_steps = n_value;
-    }
-    // Apply k factor (similar to keyhunt)
-    // baby_steps = sqrt(n * k_factor * 2^20) roughly... simplify:
-    // Actually in keyhunt, -n sets the "N" (total range per cycle) and
-    // baby_steps = sqrt(N), then k amplifies the baby table size
-    // Let's match keyhunt behavior: baby_steps = sqrt(n_value) * k_factor
-    if (n_specified) {
-        // n_value is the cycle size, baby_steps = sqrt(n_value)
-        config.baby_steps = (uint64_t)sqrt((double)n_value);
-        if (config.baby_steps < 1024) config.baby_steps = 1024;
-    }
-    config.baby_steps *= k_factor;
+    // Apply keyhunt's exact -k scaling
+    // In keyhunt BSGS mode, -k multiplies the table size by 1024 * 1024
+    // 1 factor = 1048576 table entries (approx 16MB)
+    // 128 = 2GB, 256 = 4GB, 512 = 8GB, 1024 = 16GB, etc.
+    config.baby_steps = k_factor * 1048576ULL;
+
+    // We still read -n for compatibility, but don't strictly base the table on sqrt(n)
+    // However, we optionally set n_value if specified to allow limiting the range size 
+    // per giant step cycle if that feature is added later. For now, baby_steps is strictly the table dimension.
 
     // Ensure baby_steps is reasonable
-    if (config.baby_steps < 1024) config.baby_steps = 1024;
-    if (config.baby_steps > (1ULL << 28)) {
+    if (config.baby_steps < 1048576ULL) config.baby_steps = 1048576ULL;
+    if (config.baby_steps > (1ULL << 31)) {
         printf("[!] Warning: very large baby step count (%llu), may use lots of memory\n",
             (unsigned long long)config.baby_steps);
     }

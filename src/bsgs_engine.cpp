@@ -10,6 +10,7 @@
 #include <random>
 #include <algorithm>
 #include <fstream>
+#include <cstdint>
 
 using namespace secp256k1_field;
 using namespace secp256k1_constants;
@@ -239,46 +240,74 @@ void BSGSEngine::worker_sequential(int thread_id, uint256_t start, uint256_t end
         PointAffine neg_giant = giant_step_;
         neg_giant.y = mod_neg(neg_giant.y);
 
-        // Giant step loop
+        // Giant step loop using BATCHING for ultra-fast inversions
+        const int BATCH_SIZE = 4096;
+        PointJacobian* jac_batch = new PointJacobian[BATCH_SIZE];
+        PointAffine* aff_batch = new PointAffine[BATCH_SIZE];
+        uint256_t* key_batch = new uint256_t[BATCH_SIZE];
+        
         uint64_t steps = 0;
+        
         while (current_key < end && !all_found_.load() && !target_found_[t].load()) {
-            // Lookup current point in baby table
-            int64_t baby_idx = baby_table_.lookup(point.x);
-            if (baby_idx >= 0) {
-                // Potential match! Extract actual index and endo flag
-                uint64_t raw_idx = (uint64_t)baby_idx;
-                uint64_t endo_flag = (raw_idx >> 46) & 3;
-                uint64_t actual_baby = raw_idx & ((1ULL << 46) - 1);
+            
+            // 1. Generate a batch of Jacobian points
+            int current_batch = 0;
+            // Use current_key <= end to ensure we don't truncate the very last chunk!
+            while (current_batch < BATCH_SIZE && current_key <= end && !all_found_.load() && !target_found_[t].load()) {
+                jac_batch[current_batch] = point_jac;
+                key_batch[current_batch] = current_key;
+                
+                // Move to next giant step: point = point - m*G
+                point_jac = point_add_mixed(point_jac, neg_giant);
+                current_key = uint256_add(current_key, uint256_t(m));
+                
+                current_batch++;
+            }
+            
+            if (current_batch == 0) break;
+            
+            // 2. Batch convert to Affine (1 inversion for the whole batch!)
+            to_affine_batch(jac_batch, aff_batch, current_batch);
+            
+            // 3. Process the batch (hash table lookups)
+            for (int b = 0; b < current_batch; b++) {
+                uint64_t x_prefix = aff_batch[b].x.v[0];
+                int64_t baby_idx = hash_table_->lookup(x_prefix);
+                if (baby_idx >= 0) {
+                    // Potential match! Extract actual index and endo flag
+                    uint64_t raw_idx = (uint64_t)baby_idx;
+                    uint64_t endo_flag = (raw_idx >> 46) & 3;
+                    uint64_t actual_baby = raw_idx & ((1ULL << 46) - 1);
 
-                // Reconstruct private key: key = current_key + actual_baby
-                uint256_t found_key = uint256_add(current_key, uint256_t(actual_baby));
+                    // Reconstruct private key: key = batch_key + actual_baby
+                    uint256_t baby_key = uint256_t(actual_baby);
 
-                // If endomorphism was used, adjust the key
-                if (endo_flag == 1) {
-                    // key * G = beta * P = lambda * (P * G) -> P = key * lambda^2
-                    found_key = mod_n_mul(found_key, get_lambda2());
-                } else if (endo_flag == 2) {
-                    // key * G = beta^2 * P = lambda^2 * (P * G) -> P = key * lambda
-                    found_key = mod_n_mul(found_key, get_lambda());
-                }
+                    // If endomorphism was used, adjust the key
+                    if (endo_flag == 1) {
+                        baby_key = mod_n_mul(baby_key, get_lambda2());
+                    } else if (endo_flag == 2) {
+                        baby_key = mod_n_mul(baby_key, get_lambda());
+                    }
+                    
+                    uint256_t found_key = uint256_add(key_batch[b], baby_key);
 
-                // Verify by computing found_key * G and comparing
-                PointJacobian verify_jac = scalar_mult(G_, found_key);
-                PointAffine verify = to_affine(verify_jac);
+                    // Verify by computing found_key * G and comparing
+                    PointJacobian verify_jac = scalar_mult(G_, found_key);
+                    PointAffine verify = to_affine(verify_jac);
 
-                if (verify.x == targets_[t].x && verify.y == targets_[t].y) {
-                    add_result(found_key, targets_[t], (int)t);
+                    if (verify.x == targets_[t].x && verify.y == targets_[t].y) {
+                        add_result(found_key, targets_[t], (int)t);
+                    }
                 }
             }
-
-            // Move to next giant step: point = point - m*G
-            point_jac = point_add_mixed(PointJacobian::from_affine(point), neg_giant);
-            point = to_affine(point_jac);
-
-            current_key = uint256_add(current_key, uint256_t(m));
-            steps++;
-            total_keys_.fetch_add(m, std::memory_order_relaxed);
+            
+            steps += current_batch;
+            total_keys_.fetch_add((uint64_t)m * current_batch, std::memory_order_relaxed);
         }
+
+        delete[] jac_batch;
+        delete[] aff_batch;
+        delete[] key_batch;
 
         if (!config_.quiet) {
             printf("[+] Thread %d: target %zu done (%llu giant steps)\n",
@@ -322,42 +351,82 @@ void BSGSEngine::worker_random(int thread_id) {
                 }
             }
         }
-
-        uint256_t start_key = uint256_add(config_.range_start, random_offset);
+        
+        // Ensure not zero if end == start somehow
+        uint256_t current_key = uint256_add(config_.range_start, random_offset);
+        if (!current_key.is_zero()) {
+            current_key = uint256_sub(current_key, uint256_t(1ULL));
+        }
 
         // For each target
         for (size_t t = 0; t < targets_.size() && !all_found_.load(); t++) {
             if (target_found_[t].load()) continue;
 
             // Compute: Target - start_key * G
-            PointJacobian sG = scalar_mult(G_, start_key);
+            PointJacobian sG = scalar_mult(G_, current_key);
             PointAffine sG_aff = to_affine(sG);
             PointAffine neg_sG = sG_aff;
-            neg_sG.y = mod_neg(neg_sG.y);
+            if (!neg_sG.infinity) {
+                neg_sG.y = mod_neg(neg_sG.y);
+            }
 
             PointJacobian point_jac = point_add_mixed(
                 PointJacobian::from_affine(targets_[t]), neg_sG);
-            PointAffine point = to_affine(point_jac);
 
-            // Check this point in baby table
-            int64_t baby_idx = baby_table_.lookup(point.x);
-            if (baby_idx >= 0) {
-                uint64_t raw_idx = (uint64_t)baby_idx;
-                uint64_t endo_flag = (raw_idx >> 46) & 3;
-                uint64_t actual_baby = raw_idx & ((1ULL << 46) - 1);
+            // We do a small batch of 4096 here as well
+            const int BATCH_SIZE = 4096;
+            PointJacobian* jac_batch = new PointJacobian[BATCH_SIZE];
+            PointAffine* aff_batch = new PointAffine[BATCH_SIZE];
+            uint256_t* key_batch = new uint256_t[BATCH_SIZE];
+            
+            uint256_t current_key_batch = current_key;
+            int current_batch = 0;
 
-                uint256_t found_key = uint256_add(start_key, uint256_t(actual_baby));
+            while (current_batch < BATCH_SIZE && current_key <= end && !all_found_.load() && !target_found_[t].load()) {
+                jac_batch[current_batch] = point_jac;
+                key_batch[current_batch] = current_key;
+                
+                point_jac = point_add_mixed(point_jac, neg_giant);
+                current_key = uint256_add(current_key, uint256_t(m));
+                
+                current_batch++;
+            }
+            
+            // To be much faster, we compute affine variants in batch to save modular inversions
+            PointJacobian::to_affine_batch(jac_batch, current_batch, aff_batch);
 
-                // Verify
-                PointJacobian verify_jac = scalar_mult(G_, found_key);
-                PointAffine verify = to_affine(verify_jac);
+                for (int b = 0; b < current_batch; b++) {
+                    if (aff_batch[b].infinity) continue;
 
-                if (verify.x == targets_[t].x && verify.y == targets_[t].y) {
-                    add_result(found_key, targets_[t], (int)t);
+                    int64_t baby_idx = baby_table_.lookup(aff_batch[b].x);
+                    if (baby_idx >= 0) {
+                        uint64_t raw_idx = (uint64_t)baby_idx;
+                        uint64_t endo_flag = (raw_idx >> 46) & 3;
+                        uint64_t actual_baby = raw_idx & ((1ULL << 46) - 1);
+
+                        uint256_t baby_key = uint256_t(actual_baby);
+                        if (endo_flag == 1) {
+                            baby_key = mod_n_mul(baby_key, get_lambda2());
+                        } else if (endo_flag == 2) {
+                            baby_key = mod_n_mul(baby_key, get_lambda());
+                        }
+
+                        uint256_t found_key = uint256_add(key_batch[b], baby_key);
+
+                        PointJacobian verify_jac = scalar_mult(G_, found_key);
+                        PointAffine verify = to_affine(verify_jac);
+
+                        if (verify.x == targets_[t].x && verify.y == targets_[t].y) {
+                            add_result(found_key, targets_[t], (int)t);
+                        }
+                    }
                 }
+                total_keys_.fetch_add((uint64_t)m * current_batch, std::memory_order_relaxed);
             }
 
-            total_keys_.fetch_add(m, std::memory_order_relaxed);
+            delete[] jac_batch;
+            delete[] aff_batch;
+            delete[] key_batch;
         }
     }
 }
@@ -404,19 +473,22 @@ bool BSGSEngine::run() {
     } else {
         // Sequential mode: divide range among threads
         uint256_t range_size = uint256_sub(config_.range_end, config_.range_start);
+        
+        // chunk = range_size / threads. For now, simple approximation using shr1 if power of 2
         uint256_t chunk = range_size;
-        // Simple division by thread count (approximate)
-        for (int s = 0; s < config_.num_threads - 1; s++) {
-            chunk = chunk.shr1(); // Divide by 2 for each power of 2 threads
+        int t = config_.num_threads;
+        while (t > 1) {
+            chunk = chunk.shr1();
+            t /= 2;
         }
-        // Just give each thread the full range for now; they'll coordinate via target_found
-        // A proper range split would use uint256 division
+        
+        uint256_t thread_start = config_.range_start;
         for (int i = 0; i < config_.num_threads; i++) {
-            uint256_t t_start_range = config_.range_start;
-            uint256_t t_end_range = config_.range_end;
-            // Each thread handles different targets in sequential mode
-            threads.emplace_back(&BSGSEngine::worker_sequential, this, i,
-                t_start_range, t_end_range);
+            uint256_t thread_end = (i == config_.num_threads - 1) ? config_.range_end : uint256_add(thread_start, chunk);
+            
+            threads.emplace_back(&BSGSEngine::worker_sequential, this, i, thread_start, thread_end);
+            
+            thread_start = thread_end;
         }
     }
 
